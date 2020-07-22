@@ -80,6 +80,16 @@ public:
         precisionInfo.value = CUSTOM;
     }
 
+#ifdef __clang__
+    /** @brief Creates custom precision with specific underlined type */
+    template <class T>
+    static Precision fromType(const char* typeName = nullptr);
+
+    /** @brief checks whether given storage class T can be used to store objects of current precision */
+    template <class T>
+    bool hasStorageType(const char* typeName = nullptr) const noexcept;
+#else
+
     /** @brief Creates custom precision with specific underlined type */
     template <class T>
     static Precision fromType(const char* typeName = nullptr) {
@@ -123,6 +133,7 @@ public:
             return false;
         }
     }
+#endif // __clang__
 
     /** @brief Equality operator with Precision object */
     bool operator==(const Precision& p) const noexcept {

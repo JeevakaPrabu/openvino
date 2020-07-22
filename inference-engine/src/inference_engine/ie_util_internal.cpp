@@ -602,9 +602,13 @@ std::basic_string<C> getPathName(const std::basic_string<C>& s) {
 #ifndef _WIN32
 
 static std::string getIELibraryPathUnix() {
+#ifdef __ANDROID__
+    return std::string("/vendor/lib64");
+#else
     Dl_info info;
     dladdr(reinterpret_cast<void*>(getIELibraryPath), &info);
     return getPathName(std::string(info.dli_fname)).c_str();
+#endif // __ANDROID__
 }
 
 #endif  // _WIN32

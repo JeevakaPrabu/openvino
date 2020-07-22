@@ -28,7 +28,11 @@ template<> inline short saturate_cast(int x) { return (std::min)(SHRT_MAX, (std:
 template<> inline short saturate_cast(float x) { return saturate_cast<short>(static_cast<int>(std::rint(x))); }
 template<> inline float saturate_cast(float x) { return x; }
 template<> inline short saturate_cast(short x) { return x; }
+#if defined(__ANDROID__)
+template<> inline uint16_t saturate_cast(int x) { return (std::min<unsigned int>)(USHRT_MAX, (std::max)(0, x)); }
+#else
 template<> inline uint16_t saturate_cast(int x) { return (std::min)(USHRT_MAX, (std::max)(0, x)); }
+#endif // __ANDROID__
 template<> inline uchar saturate_cast<uchar>(int v) { return (uchar)((unsigned)v <= UCHAR_MAX ? v : v > 0 ? UCHAR_MAX : 0); }
 
 //------------------------------------------------------------------------------

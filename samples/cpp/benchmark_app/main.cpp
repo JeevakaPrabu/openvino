@@ -43,8 +43,10 @@
 #include <sys/resource.h>
 #elif defined(__linux__)
 #include <fstream>
+#include <glob.h>
 #include <regex>
 #include <sstream>
+#include <unistd.h>
 #else
 #error "unsupported OS"
 #endif
@@ -92,6 +94,110 @@ int64_t get_peak_memory_usage() {
 }
 
 #else
+
+static constexpr unsigned long ULONG_UNSET = static_cast<unsigned long>(-1);
+
+typedef struct _mem_info {
+    // compile phase
+    unsigned long compile_rss_peak;
+    unsigned long compile_npu_peak;
+    // inference phase
+    unsigned long infer_rss_peak;
+    unsigned long infer_npu_peak;
+    // running base (first sample)
+    unsigned long rss_base;
+    unsigned long npu_base;
+} MEM_CONSUME_INFO;
+
+MEM_CONSUME_INFO mem_info;
+std::atomic<bool> exit_mem_read{false};
+std::atomic<bool> in_infer_phase{false};
+std::thread memory_thread_main;
+static bool mem_track_npu = false;
+
+static std::string find_npu_memory_sysfs_path() {
+    // Walk up to two PCI levels deep since NPU BDF varies per system.
+    for (const auto* pattern : {"/sys/devices/pci*/*/npu_memory_utilization",
+                                 "/sys/devices/pci*/*/*/npu_memory_utilization"}) {
+        glob_t g{};
+        if (glob(pattern, GLOB_NOSORT, nullptr, &g) == 0 && g.gl_pathc > 0) {
+            std::string path = g.gl_pathv[0];
+            globfree(&g);
+            return path;
+        }
+        globfree(&g);
+    }
+    return {};
+}
+
+static unsigned long read_npu_memory_bytes() {
+    static const std::string npu_sysfs_path = find_npu_memory_sysfs_path();
+    if (npu_sysfs_path.empty())
+        return 0;
+    std::ifstream f(npu_sysfs_path);
+    unsigned long val = 0;
+    f >> val;
+    return val;
+}
+
+static void get_memory_consumption_info() {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    while (!exit_mem_read) {
+        unsigned long tSize = 0, resident = 0, share = 0;
+        std::ifstream buffer("/proc/self/statm");
+        buffer >> tSize >> resident >> share;
+        buffer.close();
+        resident *= static_cast<unsigned long>(page_size);
+
+        if (mem_info.rss_base == ULONG_UNSET)
+            mem_info.rss_base = resident;
+
+        if (in_infer_phase) {
+            if (resident > mem_info.infer_rss_peak)
+                mem_info.infer_rss_peak = resident;
+        } else {
+            if (resident > mem_info.compile_rss_peak)
+                mem_info.compile_rss_peak = resident;
+        }
+
+        if (mem_track_npu) {
+            unsigned long npu_bytes = read_npu_memory_bytes();
+            if (mem_info.npu_base == ULONG_UNSET)
+                mem_info.npu_base = npu_bytes;
+            if (in_infer_phase) {
+                if (npu_bytes > mem_info.infer_npu_peak)
+                    mem_info.infer_npu_peak = npu_bytes;
+            } else {
+                if (npu_bytes > mem_info.compile_npu_peak)
+                    mem_info.compile_npu_peak = npu_bytes;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void init_memory_consumption(bool b_npu) {
+    exit_mem_read.store(false);
+    in_infer_phase.store(false);
+    mem_info.compile_rss_peak = 0;
+    mem_info.compile_npu_peak = 0;
+    mem_info.infer_rss_peak = 0;
+    mem_info.infer_npu_peak = 0;
+    mem_info.rss_base = ULONG_UNSET;
+    mem_info.npu_base = ULONG_UNSET;
+    mem_track_npu = b_npu;
+    memory_thread_main = std::thread(&get_memory_consumption_info);
+}
+
+void stop_memory_consumption() {
+    exit_mem_read.store(true);
+    if (memory_thread_main.joinable())
+        memory_thread_main.join();
+}
+
+void switch_to_infer_phase() {
+    in_infer_phase.store(true);
+}
 
 int64_t get_peak_memory_usage() {
     size_t peak_mem_usage_kB = 0;
@@ -395,6 +501,8 @@ int main(int argc, char* argv[]) {
 
         // ----------------- 2. Loading the OpenVINO Runtime
         // -----------------------------------------------------------
+        init_memory_consumption(device_name.find("NPU") == 0);
+
         next_step();
 
         ov::Core core;
@@ -1256,10 +1364,12 @@ int main(int argc, char* argv[]) {
             slog::info << "Skipping warmup inference due to -no_warmup flag" << slog::endl;
         }
 
+        switch_to_infer_phase();
+
         size_t processedFramesN = 0;
         auto startTime = Time::now();
         auto execTime = std::chrono::duration_cast<ns>(Time::now() - startTime).count();
-
+        uint64_t inferTimeTotal = 0;
         /** Start inference & calculate performance **/
         /** to align number if iterations to guarantee that last infer requests are
          * executed in the same conditions **/
@@ -1297,11 +1407,14 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            auto inferStartTime = Time::now();
             if (FLAGS_api == "sync") {
                 inferRequest->infer();
             } else {
                 inferRequest->start_async();
             }
+            auto inferTime = std::chrono::duration_cast<ns>(Time::now() - inferStartTime).count();
+            inferTimeTotal += inferTime;
             ++iteration;
 
             execTime = std::chrono::duration_cast<ns>(Time::now() - startTime).count();
@@ -1316,6 +1429,8 @@ int main(int argc, char* argv[]) {
 
         // wait the latest inference executions
         inferRequestsQueue.wait_all();
+
+        stop_memory_consumption();
 
         LatencyMetrics generalLatency(inferRequestsQueue.get_latencies(), "", FLAGS_latency_percentile);
         std::vector<LatencyMetrics> groupLatencies = {};
@@ -1444,8 +1559,29 @@ int main(int argc, char* argv[]) {
         }
 
         slog::info << "Throughput:          " << double_to_string(fps) << " FPS" << slog::endl;
+        slog::info << "Infer only latency:  "
+                   << inferTimeTotal / iteration / 1000000. << " ms" << slog::endl;
+        static constexpr double GB = 1024. * 1024. * 1024.;
+        slog::info << "Peak RSS (compile):  " << mem_info.compile_rss_peak / GB << " GB"
+                   << "  (base " << mem_info.rss_base / GB << " GB"
+                   << ", delta " << (mem_info.compile_rss_peak - mem_info.rss_base) / GB
+                   << " GB)" << slog::endl;
+        slog::info << "Peak RSS (infer):    " << mem_info.infer_rss_peak / GB << " GB"
+                   << "  (delta from base "
+                   << (mem_info.infer_rss_peak - mem_info.rss_base) / GB << " GB)" << slog::endl;
+        if (device_name.find("NPU") == 0) {
+            slog::info << "Peak NPU mem (compile): " << mem_info.compile_npu_peak / GB << " GB"
+                       << "  (base " << mem_info.npu_base / GB << " GB"
+                       << ", delta " << (mem_info.compile_npu_peak - mem_info.npu_base) / GB
+                       << " GB)" << slog::endl;
+            slog::info << "Peak NPU mem (infer):   " << mem_info.infer_npu_peak / GB << " GB"
+                       << "  (delta from base "
+                       << (mem_info.infer_npu_peak - mem_info.npu_base) / GB
+                       << " GB)" << slog::endl;
+        }
 
     } catch (const std::exception& ex) {
+        stop_memory_consumption();
         slog::err << ex.what() << slog::endl;
 
         if (statistics) {
